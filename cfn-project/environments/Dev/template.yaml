@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda to export Amazon Connect Routing Profile Queue Delay report
+  to an existing S3 bucket
+
+Parameters:
+
+  ConnectInstanceId:
+    Type: String
+    Description: Amazon Connect Instance ID
+
+  ExistingBucketName:
+    Type: String
+    Description: Name of an existing S3 bucket (will NOT be created)
+
+  S3Prefix:
+    Type: String
+    Default: Shiva/
+    Description: Folder/prefix inside the bucket
+
+Resources:
+
+  # ---------------------------
+  # IAM Role for Lambda
+  # ---------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: connect-routing-report-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: ConnectAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:ListRoutingProfiles
+                  - connect:ListRoutingProfileQueues
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${ExistingBucketName}/*
+
+  # ---------------------------
+  # Lambda Function
+  # ---------------------------
+  RoutingReportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: connect-routing-queue-report
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref ConnectInstanceId
+          BUCKET_NAME: !Ref ExistingBucketName
+          S3_PREFIX: !Ref S3Prefix
+          TMP_FILE: /tmp/routingqueuedelay.csv
+
+      Code:
+        ZipFile: |
+          import os
+          import csv
+          from pathlib import Path
+          from collections import defaultdict
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import boto3
+        
+          # AWS Clients Testing!!
+          connect = boto3.client("connect")
+          s3 = boto3.client("s3")
+
+          # Environment Variables
+          INSTANCE_ID = os.environ["INSTANCE_ID"]
+          BUCKET_NAME = os.environ["BUCKET_NAME"]
+          S3_PREFIX = os.environ.get("S3_PREFIX", "")
+          TMP_FILE = Path(os.environ.get("TMP_FILE", "/tmp/routingqueuedelay.csv"))
+
+
+          def lambda_handler(event, context):
+              rows = []
+
+              # Fetch all routing profiles
+              paginator = connect.get_paginator("list_routing_profiles")
+              for page in paginator.paginate(InstanceId=INSTANCE_ID):
+                  for profile in page["RoutingProfileSummaryList"]:
+                      profile_id = profile["Id"]
+                      profile_name = profile["Name"]
+                      rows.extend(get_routing_queue_data(profile_id, profile_name))
+
+              # Generate pivot CSV
+              write_pivot_csv(rows)
+
+              # Upload to S3 with timestamped filename
+              upload_to_s3()
+
+              return {
+                  "status": "success",
+                  "profiles_processed": len(set(r["Profile"] for r in rows)),
+                  "queues_processed": len(set(r["Queue"] for r in rows)),
+                  "records_written": len(rows),
+              }
+
+
+          def get_routing_queue_data(profile_id, profile_name):
+              rows = []
+
+              paginator = connect.get_paginator("list_routing_profile_queues")
+              for page in paginator.paginate(
+                  InstanceId=INSTANCE_ID,
+                  RoutingProfileId=profile_id,
+              ):
+                  for queue in page["RoutingProfileQueueConfigSummaryList"]:
+                      rows.append(
+                          {
+                              "Profile": profile_name,
+                              "Queue": queue["QueueName"],
+                              "Delay": int(queue["Delay"]),
+                          }
+                      )
+
+              return rows
+
+
+          def write_pivot_csv(rows):
+              pivot = defaultdict(dict)
+              profiles = set()
+              queues = set()
+
+              # Build pivot structure
+              for row in rows:
+                  profile = row["Profile"]
+                  queue = row["Queue"]
+                  delay = row["Delay"]
+
+                  pivot[queue][profile] = delay
+                  profiles.add(profile)
+                  queues.add(queue)
+
+              profiles = sorted(profiles)
+              queues = sorted(queues)
+
+              # Write CSV
+              with TMP_FILE.open("w", newline="") as f:
+                  writer = csv.writer(f)
+
+                  # Header
+                  writer.writerow(["Queue"] + profiles)
+
+                  # Rows
+                  for queue in queues:
+                      row = [queue] + [pivot[queue].get(profile, "-") for profile in profiles]
+                      writer.writerow(row)
+
+
+          def upload_to_s3():
+              # Current time in IST
+              now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+              # Date: 25Feb2026
+              date_part = now_ist.strftime("%d%b%Y")
+
+              # Time: 06-45PM
+              time_part = now_ist.strftime("%I-%M%p")
+
+              filename = (
+                  f"RoutingProfiles-Queues-Configuration-"
+                  f"{date_part}-{time_part}-IST.csv"
+              )
+
+              s3_key = f"{S3_PREFIX}{filename}"
+
+              s3.upload_file(str(TMP_FILE), BUCKET_NAME, s3_key)
+
+              print(f"Uploaded to S3: s3://{BUCKET_NAME}/{s3_key}")
+  # ---------------------------
+  # CloudWatch Log Group
+  # ---------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${RoutingReportLambda}
+      RetentionInDays: 14
+
+Outputs:
+
+  LambdaFunctionName:
+    Value: !Ref RoutingReportLambda
+
+  BucketUsed:
+    Value: !Ref ExistingBucketName
